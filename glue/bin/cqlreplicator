@@ -471,7 +471,7 @@ function Init {
            --connections "Connections=$glue_conn_name$DEFAULT_ENV" \
            --command "Name=$GLUE_TYPE,ScriptLocation=$glue_bucket_artifacts/scripts/CQLReplicator$DEFAULT_ENV.scala" \
            --execution-property '{"MaxConcurrentRuns": 32}' \
-           --max-retries 1 \
+           --max-retries 0 \
            --region "$AWS_REGION" \
            --default-arguments '{
                "--job-language":"scala",

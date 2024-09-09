@@ -78,8 +78,22 @@ class DlqS3Exception(s: String) extends RuntimeException {
 }
 
 sealed trait Stats
-case class DiscoveryStats(tile: Int, primaryKeys: Long, updatedTimestamp: String) extends Stats
-case class ReplicationStats(tile: Int, primaryKeys: Long, updatedPrimaryKeys: Long, insertedPrimaryKeys: Long, deletedPrimaryKeys: Long, updatedTimestamp: String) extends Stats
+case class DiscoveryStats(tile: Int,
+                          primaryKeys: Long,
+                          updatedTimestamp: String,
+                          discoveryTime: Long,
+                          s3writeTime: Long,
+                          cassandraReadTime: Long,
+                          ledgerWriteTime: Long
+                          ) extends Stats
+case class ReplicationStats(tile: Int,
+                            primaryKeys: Long,
+                            updatedPrimaryKeys: Long,
+                            insertedPrimaryKeys: Long,
+                            deletedPrimaryKeys: Long,
+                            updatedTimestamp: String,
+                            count: Long,
+                            avgReplicationTime: Long) extends Stats
 case class MaterializedViewConfig(enabled: Boolean = false, mvName: String = "")
 case class PointInTimeReplicationConfig(predicateOp: String = "greaterThan")
 case class Replication(allColumns: Boolean = true, columns: List[String] = List(""), useCustomSerializer: Boolean = false, useMaterializedView: MaterializedViewConfig = MaterializedViewConfig(),
@@ -259,7 +273,7 @@ object GlueApp {
         json
       } match {
         case Failure(_) => {
-          ReplicationStats(0, 0, 0, 0, 0, org.joda.time.LocalDateTime.now().toString)
+          ReplicationStats(0, 0, 0, 0, 0, org.joda.time.LocalDateTime.now().toString, 0L, 0L)
         }
         case Success(json) => {
           implicit val formats: DefaultFormats.type = DefaultFormats
@@ -636,12 +650,16 @@ object GlueApp {
           val updatedAggr = content.updatedPrimaryKeys + rs.updatedPrimaryKeys
           val deletedAggr = content.deletedPrimaryKeys + rs.deletedPrimaryKeys
           val historicallyInserted = content.primaryKeys + rs.primaryKeys
+          val count = content.count + rs.count
+          val avgReplicationTime = ((content.avgReplicationTime * content.count) + (rs.avgReplicationTime * rs.count)) / (content.count + rs.count) // average replication time
           (write(ReplicationStats(currentTile,
             historicallyInserted,
             updatedAggr,
             insertedAggr,
             deletedAggr,
-            org.joda.time.LocalDateTime.now().toString)),
+            org.joda.time.LocalDateTime.now().toString,
+            count,
+            avgReplicationTime)),
             s"Flushing the replication stats: $key/$objectName")
         case _ => throw new StatsS3Exception("Unknown stats type")
       }
@@ -901,6 +919,7 @@ object GlueApp {
     }
 
     def dataReplicationProcess(): Unit = {
+      val replicationStart = java.time.Instant.now()
       val ledger = internalConnectionToTarget.execute(s"SELECT location,tile,ver FROM migration.ledger WHERE ks='$srcKeyspaceName' and tbl='$srcTableName' and tile=$currentTile and load_status='' and offload_status='SUCCESS' ALLOW FILTERING").all().asScala
       val ledgerList = Option(ledger)
 
@@ -911,7 +930,7 @@ object GlueApp {
 
         if (heads > 0 && tails == 0) {
 
-          logger.info(s"Historical data load.Processing locations: $locations")
+          logger.info(s"Historical data load. Processing locations: $locations")
           locations.foreach(location => {
             val ledgerConnection = getDBConnection("KeyspacesConnector.conf", bcktName, s3client)
 
@@ -926,11 +945,19 @@ object GlueApp {
             val sourceDfV2 = sourceDf.drop("group").drop("ts")
             val tile = location._2
 
+            var shuffleStart = java.time.Instant.now()
             persistToTarget(shuffleDfV2(sourceDfV2), columns, columnsPos, tile, "insert")
+            val shuffleEnd = java.time.Instant.now()
+            val shuffleTime = java.time.temporal.ChronoUnit.MILLIS.between(shuffleStart, shuffleEnd)
+            logger.info(s"Shuffle job and persistToTarget took ${shuffleTime} ms")
             ledgerConnection.execute(s"INSERT INTO migration.ledger(ks,tbl,tile,ver,load_status,dt_load, offload_status) VALUES('$srcKeyspaceName','$srcTableName',$tile,'head','SUCCESS', toTimestamp(now()), '')")
             val cnt = sourceDfV2.count()
 
-            val content = ReplicationStats(tile, cnt, 0, 0, 0, org.joda.time.LocalDateTime.now().toString)
+            val replicationEnd = java.time.Instant.now()
+            val replicationTime : Long = java.time.temporal.ChronoUnit.MILLIS.between(replicationStart, replicationEnd)
+            logger.info(s"Replication job took ${replicationTime} ms for tile ${currentTile} to insert ${cnt} keys")
+
+            val content = ReplicationStats(tile, cnt, 0, 0, 0, org.joda.time.LocalDateTime.now().toString, 1L, replicationTime)
             putStats(landingZone.replaceAll("s3://", ""), s"$srcKeyspaceName/$srcTableName/stats/replication/$tile", "count.json", content)
             ledgerConnection.close()
           }
@@ -965,6 +992,7 @@ object GlueApp {
               if (!newInsertsDF.isEmpty) {
                 persistToTarget(newInsertsDF, columns, columnsPos, currentTile, "insert")
                 inserted = newInsertsDF.count()
+                logger.info(s"insert ${inserted} keys, delete ${deleted} keys, and update ${updated} keys")
               }
             }
             case ct if ct == "None" && counterColumns.nonEmpty => {
@@ -975,6 +1003,7 @@ object GlueApp {
               persistToTarget(newCounterUpdatesDF, columns, columnsPos, currentTile, "update")
               inserted = newInsertsDF.count()
               updated = newCounterUpdatesDF.count()
+              logger.info(s"insert ${inserted} keys, delete ${deleted} keys, and update ${updated} keys")
             }
             case _ => {
               val newUpdatesDF = dfTail.as("tail").join(dfHead.as("head"), cond, "inner").
@@ -985,6 +1014,7 @@ object GlueApp {
                 persistToTarget(newUpdatesDF, columns, columnsPos, currentTile, "update")
                 inserted = newInsertsDF.count()
                 updated = newUpdatesDF.count()
+                logger.info(s"insert ${inserted} keys, delete ${deleted} keys, and update ${updated} keys")
               }
               newUpdatesDF.unpersist()
             }
@@ -993,10 +1023,15 @@ object GlueApp {
           if (!newDeletesDF.isEmpty) {
             persistToTarget(newDeletesDF, columns, columnsPos, currentTile, "delete")
             deleted = newDeletesDF.count()
+            logger.info(s"deleted ${deleted} keys")
           }
 
+          val replicationEnd = java.time.Instant.now()
+          val replicationTime : Long = java.time.temporal.ChronoUnit.MILLIS.between(replicationStart, replicationEnd)
+          logger.info(s"Replication job took ${replicationTime} ms for tile ${currentTile} to insert ${inserted} keys, delete ${deleted} keys, and update ${updated} keys")
+
           if (!(updated != 0 && inserted != 0 && deleted != 0)) {
-            val content = ReplicationStats(currentTile, 0, updated, inserted, deleted, org.joda.time.LocalDateTime.now().toString)
+            val content = ReplicationStats(currentTile, 0, updated, inserted, deleted, org.joda.time.LocalDateTime.now().toString, 1L, replicationTime)
             putStats(landingZone.replaceAll("s3://", ""), s"$srcKeyspaceName/$srcTableName/stats/replication/$currentTile", "count.json", content)
           }
 
@@ -1015,6 +1050,7 @@ object GlueApp {
     }
 
     def keysDiscoveryProcess(): Unit = {
+      val discoveryStart = java.time.Instant.now()
       val srcTableForDiscovery = if (jsonMapping4s.replication.useMaterializedView.enabled) {
         jsonMapping4s.replication.useMaterializedView.mvName
       } else {
@@ -1025,6 +1061,7 @@ object GlueApp {
         case "lessThanOrEqual" => c <= replicationPointInTime
         case _ => true
       }
+      val cassandraReadStart = java.time.Instant.now()
       val primaryKeysDf = columnTs match {
         case ts if ts == "None" && counterColumns.isEmpty =>
           sparkSession.read.cassandraFormat(srcTableForDiscovery, srcKeyspaceName).option("inferSchema", "true").
@@ -1051,6 +1088,9 @@ object GlueApp {
             withColumn("counter_hash", xxhash64(counterColumns.map(c => col(c)): _*)).
             persist(cachingMode)
       }
+      val cassandraReadEnd = java.time.Instant.now()
+      val cassandraReadTime : Long = java.time.temporal.ChronoUnit.MILLIS.between(cassandraReadStart, cassandraReadEnd)
+      logger.info(s"Cassandra read job took ${cassandraReadTime} ms")
 
       // the init seed for xxhash64 is 42
       val groupedPkDF: DataFrame =  if (!jsonMapping4s.keyspaces.transformation.enabled) {
@@ -1078,6 +1118,7 @@ object GlueApp {
         }
 
         logger.info(s"Processing $tile, head is $head, tail is $tail, head status is $headLoadStatus, tail status is $tailLoadStatus")
+        var s3writeTime = 0L // Default value
 
         // Swap tail and head
         if ((!tail.isEmpty && tailLoadStatus == "SUCCESS") && (!head.isEmpty && headLoadStatus == "SUCCESS")) {
@@ -1091,9 +1132,12 @@ object GlueApp {
             options = JsonOptions(s"""{"paths": ["$oldTailPath"]}""")
           ).getDynamicFrame().toDF().repartition(defaultPartitions, pks.map(c => col(c)): _*)
 
+          val s3writeStart = java.time.Instant.now()
           oldTail.write.mode("overwrite").save(s"$landingZone/$srcKeyspaceName/$srcTableName/primaryKeys/tile_$tile.head")
           staged.write.mode("overwrite").save(s"$landingZone/$srcKeyspaceName/$srcTableName/primaryKeys/tile_$tile.tail")
-
+          val s3writeEnd = java.time.Instant.now()
+          s3writeTime = java.time.temporal.ChronoUnit.MILLIS.between(s3writeStart, s3writeEnd)
+          logger.info(s"S3 write job took ${s3writeTime} ms for tile ${tile}")
           ledgerConnection.execute(
             s"BEGIN UNLOGGED BATCH " +
               s"INSERT INTO migration.ledger(ks,tbl,tile,offload_status,dt_offload,location,ver, load_status, dt_load) VALUES('$srcKeyspaceName','$srcTableName',$tile, 'SUCCESS', toTimestamp(now()), 'tile_$tile.tail', 'tail','','');" +
@@ -1106,17 +1150,34 @@ object GlueApp {
         if (tail.isEmpty && (!head.isEmpty && headLoadStatus == "SUCCESS")) {
           logger.info("Loading a tail but keeping the head")
           val staged = groupedPkDF.where(col("group") === tile).repartition(defaultPartitions, pks.map(c => col(c)): _*)
+          val s3writeStart = java.time.Instant.now()
           staged.write.mode("overwrite").save(s"$landingZone/$srcKeyspaceName/$srcTableName/primaryKeys/tile_$tile.tail")
+          val s3writeEnd = java.time.Instant.now()
+          s3writeTime = java.time.temporal.ChronoUnit.MILLIS.between(s3writeStart, s3writeEnd)
+          logger.info(s"S3 write job took ${s3writeTime} ms for tile ${tile}")
           ledgerConnection.execute(s"INSERT INTO migration.ledger(ks,tbl,tile,offload_status,dt_offload,location, ver, load_status, dt_load) VALUES('$srcKeyspaceName','$srcTableName',$tile, 'SUCCESS', toTimestamp(now()), 'tile_$tile.tail', 'tail','','')")
         }
+
+        val discoveryEnd = java.time.Instant.now()
+        val discoveryTime : Long = java.time.temporal.ChronoUnit.MILLIS.between(discoveryStart, discoveryEnd)
+        logger.info(s"Discovery job took ${discoveryTime} ms for tile ${tile}")
 
         // Historical upload, the first round (head)
         if (tail.isEmpty && head.isEmpty) {
           logger.info("Loading a head")
           val staged = groupedPkDF.where(col("group") === tile).repartition(defaultPartitions, pks.map(c => col(c)): _*)
+          val s3writeStart = java.time.Instant.now()
           staged.write.mode("overwrite").save(s"$landingZone/$srcKeyspaceName/$srcTableName/primaryKeys/tile_$tile.head")
+          val s3writeEnd = java.time.Instant.now()
+          s3writeTime = java.time.temporal.ChronoUnit.MILLIS.between(s3writeStart, s3writeEnd)
+          logger.info(s"S3 write job took ${s3writeTime} ms for tile ${tile}")
+          val ledgerWriteStart = java.time.Instant.now()
           ledgerConnection.execute(s"INSERT INTO migration.ledger(ks,tbl,tile,offload_status,dt_offload,location, ver, load_status, dt_load) VALUES('$srcKeyspaceName','$srcTableName',$tile, 'SUCCESS', toTimestamp(now()), 'tile_$tile.head', 'head','','')")
-          val content = DiscoveryStats(tile, staged.count(), org.joda.time.LocalDateTime.now().toString)
+          val ledgerWriteEnd = java.time.Instant.now()
+          val ledgerWriteTime : Long = java.time.temporal.ChronoUnit.MILLIS.between(ledgerWriteStart, ledgerWriteEnd)
+          // NOTE: this insertion should be nearly instantanous to execute. Keyspace request propogates in background
+          logger.info(s"Ledger write job took ${ledgerWriteTime} ms for tile ${tile}")
+          val content = DiscoveryStats(tile, staged.count(), org.joda.time.LocalDateTime.now().toString, discoveryTime, s3writeTime, cassandraReadTime, ledgerWriteTime)
           putStats(landingZone.replaceAll("s3://", ""), s"$srcKeyspaceName/$srcTableName/stats/discovery/$tile", "count.json", content)
         }
         ledgerConnection.close()
